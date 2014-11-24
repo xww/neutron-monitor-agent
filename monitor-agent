@@ -1,0 +1,313 @@
+# Copyright 2014 OpenStack Foundation
+# All Rights Reserved.
+#
+#    Licensed under the Apache License, Version 2.0 (the "License"); you may
+#    not use this file except in compliance with the License. You may obtain
+#    a copy of the License at
+#
+#         http://www.apache.org/licenses/LICENSE-2.0
+#
+#    Unless required by applicable law or agreed to in writing, software
+#    distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+#    WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+#    License for the specific language governing permissions and limitations
+#    under the License.
+#
+# @author: lizi
+
+import eventlet
+from oslo.config import cfg
+
+from neutron.agent.common import config
+from neutron.agent.linux import interface
+from neutron.agent.linux import ovs_lib  # noqa
+from neutron.agent import rpc as agent_rpc
+from neutron.common import constants
+from neutron.common import topics
+from neutron.common import utils
+from neutron import context
+from neutron import manager
+from neutron.openstack.common import importutils
+from neutron.openstack.common import log as logging
+from neutron.openstack.common import loopingcall
+from neutron.openstack.common.rpc import proxy
+from neutron.openstack.common import service
+from neutron import service as neutron_service
+
+LOG = logging.getLogger(__name__)
+
+
+class DictModel(object):
+    """Convert dict into an object that provides attribute access to values."""
+    def __init__(self, d):
+        for key, value in d.iteritems():
+            if isinstance(value, list):
+                value = [DictModel(item) if isinstance(item, dict) else item
+                         for item in value]
+            elif isinstance(value, dict):
+                value = DictModel(value)
+
+            setattr(self, key, value)
+
+
+class MonitorAgent(manager.Manager):
+    OPTS = [
+        cfg.IntOpt('resync_interval', default=5,
+                   help=_("Interval to resync.")),
+        cfg.StrOpt('monitor_driver',
+                   default='neutron.agent.linux.monitor.Monitor',
+                   help=_("The driver used to manage the monitor.")),
+        cfg.IntOpt('ping_timeout', default=5,
+                   help=_("Ping timeout.")),
+        cfg.IntOpt('ping_interval', default=20,
+                   help=_("Interval to ping.")),
+        cfg.IntOpt('ping_report_time', default=120,
+                   help=_("if the port is unreachable longer than the time, "
+                          "report it.")),
+    ]
+
+    def __init__(self, host=None):
+        super(MonitorAgent, self).__init__(host=host)
+        self.needs_resync = False
+        self.conf = cfg.CONF
+        self.root_helper = config.get_root_helper(self.conf)
+        self.monitor_driver_cls = importutils.import_class(
+            self.conf.monitor_driver)
+        ctx = context.get_admin_context_without_session()
+        self.plugin_rpc = MonitorPluginApi(topics.MONITOR_PLUGIN, ctx)
+        # the Driver expects something that is duck typed similar to
+        # the base models.
+        self.driver_obj = self.monitor_driver_cls(self.conf,
+                                                  root_helper=self.root_helper,
+                                                  plugin=self.plugin_rpc)
+
+    def after_start(self):
+        self.run()
+        LOG.info(_("Monitor agent started"))
+
+    def run(self):
+        """Activate the Monitor agent."""
+        self.sync_state()
+        self.periodic_resync()
+
+    @utils.synchronized('monitor-agent')
+    def sync_state(self):
+        """Sync the local Monitor state with Neutron."""
+        LOG.info(_('Synchronizing state'))
+        known_monitor_ids = set(self.driver_obj.get_monitors().keys())
+
+        try:
+            active_monitors = self.plugin_rpc.monitor_get_active_info()
+            active_monitor_ids = set(monitor.id for monitor in active_monitors)
+            for deleted_id in known_monitor_ids - active_monitor_ids:
+                try:
+                    self.disable_monitor_helper(deleted_id)
+                except Exception:
+                    self.needs_resync = True
+                    LOG.exception(_('Unable to sync monitor state on deleted '
+                                    'monitor %s'), deleted_id)
+
+            for monitor in active_monitors:
+                self.enable_monitor(monitor)
+            LOG.info(_('Synchronizing state complete'))
+
+        except Exception:
+            self.needs_resync = True
+            LOG.exception(_('Unable to sync monitor state.'))
+
+    def _periodic_resync_helper(self):
+        """Resync the monitor state at the configured interval."""
+        while True:
+            eventlet.sleep(self.conf.resync_interval)
+            if self.needs_resync:
+                self.needs_resync = False
+                self.sync_state()
+
+    def periodic_resync(self):
+        """Spawn a thread to periodically resync the monitor state."""
+        eventlet.spawn(self._periodic_resync_helper)
+
+    def safe_get_monitor_info(self, monitor_id):
+        try:
+            monitors = self.plugin_rpc.monitor_get_active_info([monitor_id])
+            if not monitors or len(monitors) < 1:
+                LOG.warn(_('Monitor %s has been deleted.'), monitor_id)
+            return monitors[0]
+        except Exception:
+            self.needs_resync = True
+            LOG.exception(_('Monitor %s info call failed.'), monitor_id)
+
+    def enable_monitor_helper(self, monitor_id):
+        """Enable Monitor for a monitor that meets enabling criteria."""
+        monitor = self.safe_get_monitor_info(monitor_id)
+        if monitor:
+            self.enable_monitor(monitor)
+
+    def enable_monitor(self, monitor):
+        self.driver_obj.start_monitor(monitor)
+
+    def disable_monitor_helper(self, monitor_id):
+        """Disable Monitor for a monitor known to the agent."""
+        self.driver_obj.stop_monitor(monitor_id)
+
+    def get_state(self):
+        monitors = self.driver_obj.get_monitors()
+        return {'num_monitor': len(monitors)}
+
+    # rpc
+    @utils.synchronized('monitor-agent')
+    def monitor_deleted(self, context, monitor_id):
+        """Deal with monitor deletion RPC message."""
+        LOG.debug(_('Got monitor deleted notification for %s'), monitor_id)
+        self.disable_monitor_helper(monitor_id)
+
+    @utils.synchronized('monitor-agent')
+    def monitor_updated(self, context, monitor_id):
+        """Deal with monitors modification and creation RPC message."""
+        LOG.debug(_('Got monitor updated notification :%s'), monitor_id)
+        self.enable_monitor_helper(monitor_id)
+
+    @utils.synchronized('monitor-agent')
+    def monitor_removed_from_agent(self, context, payload):
+        LOG.debug(_('Got monitor removed from agent :%r'), payload)
+        self.disable_monitor_helper(payload['monitor_id'])
+
+    @utils.synchronized('monitor-agent')
+    def monitor_added_to_agent(self, context, payload):
+        LOG.debug(_('Got monitor added to agent :%r'), payload)
+        self.monitor_updated(context, payload)
+
+    @utils.synchronized('monitor-agent')
+    def port_update_end(self, context, payload):
+        """Handle the port.update.end notification event."""
+        updated_port = DictModel(payload['port'])
+        network_id = updated_port.get('network_id')
+        if network_id:
+            active_monitors = self.plugin_rpc.monitor_get_active_info()
+            for m in active_monitors:
+                if m['network_id'] == network_id:
+                    self.monitor_updated(context, m['id'])
+
+
+class MonitorPluginApi(proxy.RpcProxy):
+    """Agent side of the monitor rpc API.
+
+    API version history:
+        1.0 - Initial version.
+    """
+
+    BASE_RPC_API_VERSION = '1.0'
+
+    def __init__(self, topic, context):
+        super(MonitorPluginApi, self).__init__(
+            topic=topic, default_version=self.BASE_RPC_API_VERSION)
+        self.context = context
+        self.host = cfg.CONF.host
+
+    def monitor_get_active_info(self, monitor_ids=None):
+        """Make a remote process call to retrieve all monitor info."""
+        monitors = self.call(self.context,
+                             self.make_msg('monitor_get_active_info',
+                                           host=self.host),
+                             topic=self.topic)
+        return [DictModel(n) for n in monitors]
+
+    def monitor_create_port(self, port):
+        """Make a remote process call to create the monitor port."""
+        port = self.call(self.context,
+                         self.make_msg('monitor_create_port',
+                                       port=port,
+                                       host=self.host),
+                         topic=self.topic)
+        if port:
+            return DictModel(port)
+
+    def monitor_release_port(self, network_id, device_id):
+        """Make a remote process call to release the monitor port."""
+        return self.call(self.context,
+                         self.make_msg('monitor_release_port',
+                                       network_id=network_id,
+                                       device_id=device_id,
+                                       host=self.host),
+                         topic=self.topic)
+
+    def monitor_update_port_status(self, tenant_id, port_id,
+                                   since, recover=None):
+        """Make a remote process call to notify a port down."""
+        self.call(self.context,
+                  self.make_msg('monitor_update_port_status',
+                                tenant_id=tenant_id,
+                                port_id=port_id,
+                                since=since,
+                                recover=recover,
+                                host=self.host),
+                  topic=self.topic)
+
+
+class MonitorAgentWithStateReport(MonitorAgent):
+    def __init__(self, host=None):
+        super(MonitorAgentWithStateReport, self).__init__(host=host)
+        self.state_rpc = agent_rpc.PluginReportStateAPI(topics.PLUGIN)
+        self.agent_state = {
+            'binary': 'neutron-monitor-agent',
+            'host': host,
+            'topic': topics.MONITOR_AGENT,
+            'configurations': {'monitor_driver': cfg.CONF.monitor_driver},
+            'start_flag': True,
+            'agent_type': constants.AGENT_TYPE_MONITOR}
+        report_interval = cfg.CONF.AGENT.report_interval
+        self.use_call = True
+        if report_interval:
+            self.heartbeat = loopingcall.FixedIntervalLoopingCall(
+                self._report_state)
+            self.heartbeat.start(interval=report_interval)
+
+    def _report_state(self):
+        try:
+            self.agent_state.get('configurations').update(self.get_state())
+            ctx = context.get_admin_context_without_session()
+            self.state_rpc.report_state(ctx, self.agent_state, self.use_call)
+            self.use_call = False
+        except AttributeError:
+            # This means the server does not support report_state
+            LOG.warn(_("Neutron server does not support state report."
+                       " State report for this agent will be disabled."))
+            self.heartbeat.stop()
+            self.run()
+            return
+        except Exception:
+            LOG.exception(_("Failed reporting state!"))
+            return
+        if self.agent_state.pop('start_flag', None):
+            self.run()
+
+    def agent_updated(self, context, payload):
+        """Handle the agent_updated notification event."""
+        self.needs_resync = True
+        LOG.info(_("agent_updated by server side %s!"), payload)
+
+    def after_start(self):
+        LOG.info(_("Monitor agent started"))
+
+
+def register_options():
+    cfg.CONF.register_opts(MonitorAgent.OPTS)
+    config.register_interface_driver_opts_helper(cfg.CONF)
+    config.register_use_namespaces_opts_helper(cfg.CONF)
+    config.register_agent_state_opts_helper(cfg.CONF)
+    config.register_root_helper(cfg.CONF)
+    cfg.CONF.register_opts(interface.OPTS)
+
+
+def main():
+    eventlet.monkey_patch()
+    register_options()
+    cfg.CONF(project='neutron')
+    config.setup_logging(cfg.CONF)
+    server = neutron_service.Service.create(
+        binary='neutron-monitor-agent',
+        topic=topics.MONITOR_AGENT,
+        report_interval=cfg.CONF.AGENT.report_interval,
+        manager='neutron.agent.monitor_agent.MonitorAgentWithStateReport')
+    service.launch(server).wait()
+hzxiongwenwu@10-180-0-65:~$ 
